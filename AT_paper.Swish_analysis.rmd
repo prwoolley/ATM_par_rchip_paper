@@ -1,0 +1,1789 @@
+---
+title: "Swish_analysis.rmd"
+author: "Phillip Woolley"
+date: "6/2/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Library Imports
+```{r}
+library(fishpond)
+library(tximeta)
+library(SummarizedExperiment)
+library(org.Hs.eg.db)
+library(tidyverse)
+library("twosamples")
+library(ggpubr)
+library(ggrepel)
+library(pheatmap)
+library(fgsea)
+```
+
+
+## Data import and processing
+### Data import
+```{r}
+AT.coldata <- read.csv("AT.coldata.csv")
+# Do not run the following line if C_1583 is desired
+AT.coldata <- dplyr::filter(AT.coldata,!grepl('1583', name))
+
+AT.coldata$files <- file.path(".","AT.salmon", AT.coldata$name, "quant.sf")
+
+all(file.exists(AT.coldata$files))
+
+AT.coldata <- AT.coldata[,c(1,3,4,5)]
+names(AT.coldata) <- c("names",'tissue','condition','files')
+```
+
+
+### Creating Summarized Experiment Object
+```{r}
+# se = SummarizedExperiment (object type)
+AT.se <- tximeta(AT.coldata)
+
+assayNames(AT.se)
+head(rownames(AT.se))
+
+```
+
+
+### Gene Comparison
+```{r}
+AT.gse <- summarizeToGene(AT.se)
+AT.gy <- AT.gse
+cer <- AT.gy[,AT.gy$tissue =="Cer"]
+ba9 <- AT.gy[,AT.gy$tissue =="BA9"]
+ba10 <- AT.gy[,AT.gy$tissue =="BA10"]
+
+cer$condition <- factor(cer$condition, levels=c("C","AT"))
+ba9$condition <- factor(ba9$condition, levels=c("C","AT"))
+ba10$condition <- factor(ba10$condition,levels=c("C",'AT'))
+
+
+cer <- scaleInfReps(cer)
+cer <- labelKeep(cer)
+cer <- cer[mcols(cer)$keep,]
+set.seed(1)
+cer <- swish(cer, x="condition")
+
+ba9 <- scaleInfReps(ba9)
+ba9 <- labelKeep(ba9)
+ba9 <- ba9[mcols(ba9)$keep,]
+set.seed(1)
+ba9 <- swish(ba9, x="condition")
+
+ba10 <- scaleInfReps(ba10)
+ba10 <- labelKeep(ba10)
+ba10 <- ba10[mcols(ba10)$keep,]
+set.seed(1)
+ba10 <- swish(ba10, x="condition")
+#table(mcols(cer)$qvalue < .05)
+#hist(mcols(y)$pvalue, col="grey")
+
+# Finding genes with the most extreme log2FC
+# with(mcols(cer),
+#      table(sig=qvalue < .05, sign.lfc=sign(log2FC))
+#      )
+
+cer <- addIds(cer, "SYMBOL", gene=TRUE)
+ba9 <- addIds(ba9, "SYMBOL", gene=TRUE)
+ba10 <- addIds(ba10, "SYMBOL", gene=TRUE)
+
+# Saving output as a dataframe
+cer_cols <- as.data.frame(mcols(cer))
+ba9_cols <- as.data.frame(mcols(ba9))
+ba10_cols <- as.data.frame(mcols(ba10))
+
+# Saving scaled, median-ratio normalized counts as a dataframe
+AT.gy_counts <- as.data.frame(assays(scaleInfReps(AT.gy)))%>%
+  dplyr::filter(group_name=="counts")
+AT.gy_counts$gene_id <- rownames(AT.gy_counts)
+AT.gy_counts$C_Cer_mean <- rowMeans(dplyr::select(AT.gy_counts,starts_with("C_Cer")))
+AT.gy_counts$C_BA10_mean <- rowMeans(dplyr::select(AT.gy_counts,starts_with("C_BA10")))
+AT.gy_counts$C_BA9_mean <- rowMeans(dplyr::select(AT.gy_counts,starts_with("C_BA9")))
+
+```
+
+
+### Cerebellum Gene comparison dataframe manipulation
+```{r}
+cer_cols_tidy <- dplyr::select(cer_cols,
+                              gene_name,
+                              gene_id,
+                              canonical_transcript,
+                              log2FC,qvalue,
+                              log10mean)
+
+# To remove mitochondrial genes
+cer_cols_tidy <- cer_cols_tidy[!grepl("^MT", cer_cols_tidy$gene_name),]
+
+# Gene GC Content
+cer_cols_tidy <- left_join(cer_cols_tidy,read.delim('./gencode.v39.primary_assembly.annotation.GENES.GC.Content.txt',col.names = c('gene_id','gene_gc_content','prom_gc_content','prom_max_gc_content','max_seg_gc_content'))%>% mutate(gene_id = substr(gene_id,1,15)),by = 'gene_id')
+cer_cols_tidy <- drop_na(cer_cols_tidy,gene_gc_content,prom_max_gc_content,prom_gc_content,max_seg_gc_content)
+cer_cols_tidy<- cer_cols_tidy%>%mutate(gene_gc_content_quantile = ntile(cer_cols_tidy$gene_gc_content,4))
+cer_cols_tidy<- cer_cols_tidy%>%mutate(prom_gc_content_quantile = ntile(cer_cols_tidy$prom_gc_content,4))
+cer_cols_tidy<- cer_cols_tidy%>%mutate(seg_gc_content_quantile = ntile(cer_cols_tidy$max_seg_gc_content,4))
+
+# GC Skew
+cer_cols_tidy <- left_join(cer_cols_tidy,read.delim('./gencode.v39.primary_assembly.annotation.GENES.GC.Skew.txt',col.names = c('gene_id','gene_gc_skew','prom_gc_skew','max_seg_gc_skew','min_seg_gc_skew'))%>% mutate(gene_id = substr(gene_id,1,15)),by = 'gene_id')
+cer_cols_tidy <- drop_na(cer_cols_tidy,gene_gc_skew,prom_gc_skew,max_seg_gc_skew,min_seg_gc_skew)
+
+
+# Gene length
+cer_cols_tidy <- left_join(cer_cols_tidy,
+          read.table('gencode.v39.primary_assembly.annotation.GENES.length.txt',
+                     header=FALSE,
+                     col.names = c("length","gene_id")),
+          by = "gene_id")
+
+cer_cols_tidy <- cer_cols_tidy%>%mutate(is_lower_0.1=ifelse(log2FC<(-1) & qvalue<0.1,'is_lower_0.1','not_lower_0.1'))
+cer_cols_tidy <- cer_cols_tidy%>%mutate(status_0.1=ifelse(log2FC<(-1) & qvalue<0.1,
+                                                      yes = 'is_lower_0.1',
+                                                      no = ifelse(log2FC>1 & qvalue<0.1,
+                                                                  yes = "is_higher_0.1",
+                                                                  no = "unaffected")))
+
+cer_cols_tidy <- cer_cols_tidy%>%mutate(is_lower_0.05=ifelse(log2FC<(-1) & qvalue<0.05,'is_lower_0.05','not_lower_0.05'))
+cer_cols_tidy <- cer_cols_tidy%>%mutate(status_0.05=ifelse(log2FC<(-1) & qvalue<0.05,
+                                                      yes = 'is_lower_0.05',
+                                                      no = ifelse(log2FC>1 & qvalue<0.05,
+                                                                  yes = "is_higher_0.05",
+                                                                  no = "unaffected")))
+
+cer_cols_tidy <- cer_cols_tidy%>%mutate(is_lower_0.01=ifelse(log2FC<(-1) & qvalue<0.01,'is_lower_0.01','not_lower_0.01'))
+cer_cols_tidy <- cer_cols_tidy%>%mutate(status_0.01=ifelse(log2FC<(-1) & qvalue<0.01,
+                                                      yes = 'is_lower_0.01',
+                                                      no = ifelse(log2FC>1 & qvalue<0.01,
+                                                                  yes = "is_higher_0.01",
+                                                                  no = "unaffected")))
+cer_cols_tidy <- cer_cols_tidy%>%mutate(status_0.01_quarter=ifelse(log2FC<(-2) & qvalue<0.01,
+                                                      yes = 'is_lower_0.01_quarter',
+                                                      no = ifelse(log2FC>2 & qvalue<0.01,
+                                                                  yes = "is_higher_0.01_quarter",
+                                                                  no = "unaffected")))
+
+
+cer_cols_tidy <- left_join(cer_cols_tidy,
+          dplyr::select(dplyr::filter(AT.gy_counts,C_Cer_mean>10),
+                        gene_id,C_Cer_mean),
+          by = "gene_id")
+
+cer_cols_tidy <- mutate(cer_cols_tidy,exp_quantile = ntile(C_Cer_mean,100))
+```
+
+### BA9 Cortex Gene comparison dataframe manipulation
+```{r}
+ba9_cols_tidy <- dplyr::select(ba9_cols,
+                              gene_name,
+                              gene_id,
+                              canonical_transcript,
+                              log2FC,qvalue,
+                              log10mean)
+
+# To remove mitochondrial genes
+ba9_cols_tidy <- ba9_cols_tidy[!grepl("^MT", ba9_cols_tidy$gene_name),]
+
+# Gene GC
+ba9_cols_tidy <- left_join(ba9_cols_tidy,read.delim('./gencode.v39.primary_assembly.annotation.GENES.GC.Content.txt',col.names = c('gene_id','gene_gc_content','prom_gc_content','prom_max_gc_content','max_seg_gc_content'))%>% mutate(gene_id = substr(gene_id,1,15)),by = 'gene_id')
+ba9_cols_tidy <- drop_na(ba9_cols_tidy,prom_max_gc_content,gene_gc_content,prom_gc_content,max_seg_gc_content)
+ba9_cols_tidy<- ba9_cols_tidy%>%mutate(gene_gc_content_quantile = ntile(ba9_cols_tidy$gene_gc_content,4))
+ba9_cols_tidy<- ba9_cols_tidy%>%mutate(prom_gc_content_quantile = ntile(ba9_cols_tidy$prom_gc_content,4))
+ba9_cols_tidy<- ba9_cols_tidy%>%mutate(seg_gc_content_quantile = ntile(ba9_cols_tidy$max_seg_gc_content,4))
+
+# Gene length
+ba9_cols_tidy <- left_join(ba9_cols_tidy,
+          read.table('gencode.v39.primary_assembly.annotation.GENES.length.txt',
+                     header=FALSE,
+                     col.names = c("length","gene_id")),
+          by = "gene_id")
+
+ba9_cols_tidy <- ba9_cols_tidy%>%mutate(is_lower_0.1=ifelse(log2FC<(-1) & qvalue<0.1,'is_lower_0.1','not_lower_0.1'))
+ba9_cols_tidy <- ba9_cols_tidy%>%mutate(status_0.1=ifelse(log2FC<(-1) & qvalue<0.1,
+                                                      yes = 'is_lower_0.1',
+                                                      no = ifelse(log2FC>1 & qvalue<0.1,
+                                                                  yes = "is_higher_0.1",
+                                                                  no = "unaffected")))
+
+ba9_cols_tidy <- ba9_cols_tidy%>%mutate(is_lower_0.05=ifelse(log2FC<(-1) & qvalue<0.05,'is_lower_0.05','not_lower_0.05'))
+ba9_cols_tidy <- ba9_cols_tidy%>%mutate(status_0.05=ifelse(log2FC<(-1) & qvalue<0.05,
+                                                      yes = 'is_lower_0.05',
+                                                      no = ifelse(log2FC>1 & qvalue<0.05,
+                                                                  yes = "is_higher_0.05",
+                                                                  no = "unaffected")))
+
+ba9_cols_tidy <- ba9_cols_tidy%>%mutate(is_lower_0.01=ifelse(log2FC<(-1) & qvalue<0.01,'is_lower_0.01','not_lower_0.01'))
+ba9_cols_tidy <- ba9_cols_tidy%>%mutate(status_0.01=ifelse(log2FC<(-1) & qvalue<0.01,
+                                                      yes = 'is_lower_0.01',
+                                                      no = ifelse(log2FC>1 & qvalue<0.01,
+                                                                  yes = "is_higher_0.01",
+                                                                  no = "unaffected")))
+
+ba9_cols_tidy <- ba9_cols_tidy%>%mutate(status_0.01_quarter=ifelse(log2FC<(-2) & qvalue<0.01,
+                                                      yes = 'is_lower_0.01_quarter',
+                                                      no = ifelse(log2FC>2 & qvalue<0.01,
+                                                                  yes = "is_higher_0.01_quarter",
+                                                                  no = "unaffected")))
+
+ba9_cols_tidy <- left_join(ba9_cols_tidy,
+          dplyr::select(dplyr::filter(AT.gy_counts,C_BA9_mean>10),gene_id,C_BA9_mean),
+          by = "gene_id")
+
+ba9_cols_tidy <- mutate(ba9_cols_tidy,exp_quantile = ntile(C_BA9_mean,100))
+```
+
+### BA10 Cortex Gene comparison dataframe manipulation
+```{r}
+ba10_cols_tidy <- dplyr::select(ba10_cols,
+                              gene_name,
+                              gene_id,
+                              canonical_transcript,
+                              log2FC,qvalue,
+                              log10mean)
+
+# To remove mitochondrial genes
+ba10_cols_tidy <- ba10_cols_tidy[!grepl("^MT", ba10_cols_tidy$gene_name),]
+
+# Gene GC
+ba10_cols_tidy <- left_join(ba10_cols_tidy,read.delim('./gencode.v39.primary_assembly.annotation.GENES.GC.Content.txt',col.names = c('gene_id','gene_gc_content','prom_gc_content','prom_max_gc_content','max_seg_gc_content'))%>% mutate(gene_id = substr(gene_id,1,15)),by = 'gene_id')
+ba10_cols_tidy <- drop_na(ba10_cols_tidy,gene_gc_content,prom_max_gc_content,prom_gc_content,max_seg_gc_content)
+ba10_cols_tidy<- ba10_cols_tidy%>%mutate(gene_gc_content_quantile = ntile(ba10_cols_tidy$gene_gc_content,4))
+ba10_cols_tidy<- ba10_cols_tidy%>%mutate(prom_gc_content_quantile = ntile(ba10_cols_tidy$prom_gc_content,4))
+ba10_cols_tidy<- ba10_cols_tidy%>%mutate(seg_gc_content_quantile = ntile(ba10_cols_tidy$max_seg_gc_content,4))
+
+# Gene length
+ba10_cols_tidy <- left_join(ba10_cols_tidy,
+          read.table('gencode.v39.primary_assembly.annotation.GENES.length.txt',
+                     header=FALSE,
+                     col.names = c("length","gene_id")),
+          by = "gene_id")
+
+ba10_cols_tidy <- ba10_cols_tidy%>%mutate(is_lower_0.1=ifelse(log2FC<(-1) & qvalue<0.1,'is_lower_0.1','not_lower_0.1'))
+ba10_cols_tidy <- ba10_cols_tidy%>%mutate(status_0.1=ifelse(log2FC<(-1) & qvalue<0.1,
+                                                      yes = 'is_lower_0.1',
+                                                      no = ifelse(log2FC>1 & qvalue<0.1,
+                                                                  yes = "is_higher_0.1",
+                                                                  no = "unaffected")))
+
+ba10_cols_tidy <- ba10_cols_tidy%>%mutate(is_lower_0.05=ifelse(log2FC<(-1) & qvalue<0.05,'is_lower_0.05','not_lower_0.05'))
+ba10_cols_tidy <- ba10_cols_tidy%>%mutate(status_0.05=ifelse(log2FC<(-1) & qvalue<0.05,
+                                                      yes = 'is_lower_0.05',
+                                                      no = ifelse(log2FC>1 & qvalue<0.05,
+                                                                  yes = "is_higher_0.05",
+                                                                  no = "unaffected")))
+
+ba10_cols_tidy <- ba10_cols_tidy%>%mutate(is_lower_0.01=ifelse(log2FC<(-1) & qvalue<0.01,'is_lower_0.01','not_lower_0.01'))
+ba10_cols_tidy <- ba10_cols_tidy%>%mutate(status_0.01=ifelse(log2FC<(-1) & qvalue<0.01,
+                                                      yes = 'is_lower_0.01',
+                                                      no = ifelse(log2FC>1 & qvalue<0.01,
+                                                                  yes = "is_higher_0.01",
+                                                                  no = "unaffected")))
+ba10_cols_tidy <- ba10_cols_tidy%>%mutate(status_0.01_quarter=ifelse(log2FC<(-2) & qvalue<0.01,
+                                                      yes = 'is_lower_0.01_quarter',
+                                                      no = ifelse(log2FC>2 & qvalue<0.01,
+                                                                  yes = "is_higher_0.01_quarter",
+                                                                  no = "unaffected")))
+ba10_cols_tidy <- left_join(ba10_cols_tidy,
+          dplyr::select(dplyr::filter(AT.gy_counts,C_BA10_mean>10),gene_id,C_BA10_mean),
+          by = "gene_id")
+
+ba10_cols_tidy <- mutate(ba10_cols_tidy,exp_quantile = ntile(C_BA10_mean,100))
+```
+
+## Cerebellum Heatmap
+```{r}
+### Looking at the 500 genes with the highest abs(Log2FC)
+cer_heatmap_data <- cer_cols_tidy %>% dplyr::filter(status_0.1!="unaffected") %>%
+  slice_max(abs(log2FC),n=500) %>%
+  dplyr::select(gene_id) %>%
+  left_join(AT.gy_counts,by = "gene_id") %>%
+  dplyr::select(contains("Cer"),-C_Cer_mean,gene_id) %>%
+  column_to_rownames("gene_id")
+  
+heatmap(as.matrix(cer_heatmap_data),labCol = c("AT 836","C 5928","C 1229","AT 6249","AT 1459","C 5470","AT 4874","C 1710","AT 5512"),labRow = NA)
+
+pheatmap(as.matrix(cer_heatmap_data),
+         scale="row", 
+         show_rownames = FALSE,
+         clustering_distance_cols = "euclidean",
+         labels_col=c('','','','','','','','',''),
+         width=7,height = 7,filename="../Figures/AT.Figures/cer_heatmap.tiff",
+         color = colorRampPalette(c("#FFB000", "white","#648FFF"))(50))
+```
+## GSEA
+### Cerebellum GSEA Analysis
+```{r}
+cer_ranks <- cer_cols_tidy$log2FC
+names(cer_ranks) <- cer_cols_tidy$gene_name
+head(cer_ranks)
+
+barplot(sort(cer_ranks, decreasing = T))
+
+hallmark_set <- gmtPathways("../GSEA/h.all.v7.5.1.symbols.gmt")
+hallmark_cer_fgseaRes <- fgsea(hallmark_set, cer_ranks, minSize=15, maxSize = 500)
+head(hallmark_cer_fgseaRes[order(padj, -abs(NES)), ], n=10)
+hallmark_cer_fgseaRes <- mutate(hallmark_cer_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+position_set <- gmtPathways("../GSEA/c1.all.v7.5.1.symbols.gmt")
+position_cer_fgseaRes <- fgsea(position_set, cer_ranks, minSize=15, maxSize = 500)
+head(position_cer_fgseaRes[order(padj, -abs(NES)), ], n=10)
+position_cer_fgseaRes <- mutate(position_cer_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+kegg_set <- gmtPathways("../GSEA/c2.cp.kegg.v7.5.1.symbols.gmt")
+kegg_cer_fgseaRes <- fgsea(kegg_set, cer_ranks, minSize=15, maxSize = 500)
+head(kegg_cer_fgseaRes[order(padj, -abs(NES)), ], n=10)
+kegg_cer_fgseaRes <- mutate(kegg_cer_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+reactome_set <- gmtPathways("../GSEA/c2.cp.reactome.v7.5.1.symbols.gmt")
+reactome_cer_fgseaRes <- fgsea(reactome_set, cer_ranks, minSize=15, maxSize = 500)
+head(reactome_cer_fgseaRes[order(padj, -abs(NES)), ], n=10)
+reactome_cer_fgseaRes <- mutate(reactome_cer_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+# Transcription factor targets
+tft_set <- gmtPathways("../GSEA/c3.tft.v7.5.1.symbols.gmt")
+tft_cer_fgseaRes <- fgsea(tft_set, cer_ranks, minSize=15, maxSize = 500)
+head(tft_cer_fgseaRes[order(padj, -abs(NES)), ], n=10)
+tft_cer_fgseaRes <- mutate(tft_cer_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+```
+#### Plots
+```{r}
+kegg_cer_fgseaRes_up <- kegg_cer_fgseaRes[NES > 0][head(order(padj), n=10), pathway]
+kegg_cer_fgseaRes_down <- kegg_cer_fgseaRes[NES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(kegg_cer_fgseaRes_up, rev(kegg_cer_fgseaRes_down))
+as_ggplot(plotGseaTable(kegg_set[topPathways], cer_ranks, kegg_cer_fgseaRes,
+              gseaParam=0.5,render=F))
+ggsave(path = "../Figures/AT.Figures/tifs/fgsea",width=8,height=10,units ='in',device='pdf',dpi=300,'cer.fgsea.kegg.pdf',
+       plot = )
+
+tft_cer_fgseaRes_up <- tft_cer_fgseaRes[NES > 0][head(order(padj), n=10), pathway]
+tft_cer_fgseaRes_down <- tft_cer_fgseaRes[NES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(tft_cer_fgseaRes_up, rev(tft_cer_fgseaRes_down))
+as_ggplot(plotGseaTable(tft_set[topPathways], cer_ranks, tft_cer_fgseaRes,
+              gseaParam=0.5,render=F))
+ggsave(path = "../Figures/AT.Figures/tifs/fgsea",width=8,height=10,units ='in',device='pdf',dpi=300,'cer.fgsea.tft.pdf',
+       plot = )
+
+reactome_cer_fgseaRes_up <- reactome_cer_fgseaRes[NES > 0][head(order(padj), n=10), pathway]
+reactome_cer_fgseaRes_down <- reactome_cer_fgseaRes[NES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(reactome_cer_fgseaRes_up, rev(reactome_cer_fgseaRes_down))
+as_ggplot(plotGseaTable(reactome_set[topPathways], cer_ranks, reactome_cer_fgseaRes,
+              gseaParam=0.5,render=F))
+ggsave(path = "../Figures/AT.Figures/tifs/fgsea",width=8,height=10,units ='in',device='pdf',dpi=300,'cer.fgsea.reactome.pdf',
+       plot = )
+
+```
+### BA9 GSEA Analysis
+```{r}
+ba9_ranks <- ba9_cols_tidy$log2FC
+names(ba9_ranks) <- ba9_cols_tidy$gene_name
+head(ba9_ranks)
+
+barplot(sort(ba9_ranks, decreasing = T))
+
+hallmark_set <- gmtPathways("../GSEA/h.all.v7.5.1.symbols.gmt")
+hallmark_ba9_fgseaRes <- fgsea(hallmark_set, ba9_ranks, minSize=15, maxSize = 500)
+head(hallmark_ba9_fgseaRes[order(padj, -abs(NES)), ], n=10)
+hallmark_ba9_fgseaRes <- mutate(hallmark_ba9_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+position_set <- gmtPathways("../GSEA/c1.all.v7.5.1.symbols.gmt")
+position_ba9_fgseaRes <- fgsea(position_set, ba9_ranks, minSize=15, maxSize = 500)
+head(position_ba9_fgseaRes[order(padj, -abs(NES)), ], n=10)
+position_ba9_fgseaRes <- mutate(position_ba9_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+kegg_set <- gmtPathways("../GSEA/c2.cp.kegg.v7.5.1.symbols.gmt")
+kegg_ba9_fgseaRes <- fgsea(kegg_set, ba9_ranks, minSize=15, maxSize = 500)
+head(kegg_ba9_fgseaRes[order(padj, -abs(NES)), ], n=10)
+kegg_ba9_fgseaRes <- mutate(kegg_ba9_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+reactome_set <- gmtPathways("../GSEA/c2.cp.reactome.v7.5.1.symbols.gmt")
+reactome_ba9_fgseaRes <- fgsea(reactome_set, ba9_ranks, minSize=15, maxSize = 500)
+head(reactome_ba9_fgseaRes[order(padj, -abs(NES)), ], n=10)
+reactome_ba9_fgseaRes <- mutate(reactome_ba9_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+# Transcription factor targets
+tft_set <- gmtPathways("../GSEA/c3.tft.v7.5.1.symbols.gmt")
+tft_ba9_fgseaRes <- fgsea(tft_set, ba9_ranks, minSize=15, maxSize = 500)
+head(tft_ba9_fgseaRes[order(padj, -abs(NES)), ], n=10)
+tft_ba9_fgseaRes <- mutate(tft_ba9_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+```
+#### Plots
+```{r}
+kegg_ba9_fgseaRes_up <- kegg_ba9_fgseaRes[NES > 0][head(order(padj), n=10), pathway]
+kegg_ba9_fgseaRes_down <- kegg_ba9_fgseaRes[NES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(kegg_ba9_fgseaRes_up, rev(kegg_ba9_fgseaRes_down))
+as_ggplot(plotGseaTable(kegg_set[topPathways], ba9_ranks, kegg_ba9_fgseaRes,
+              gseaParam=0.5,render=F))
+ggsave(path = "../Figures/AT.Figures/tifs/fgsea",width=8,height=10,units ='in',device='pdf',dpi=300,'ba9.fgsea.kegg.pdf',
+       plot = )
+
+tft_ba9_fgseaRes_up <- tft_ba9_fgseaRes[NES > 0][head(order(padj), n=10), pathway]
+tft_ba9_fgseaRes_down <- tft_ba9_fgseaRes[NES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(tft_ba9_fgseaRes_up, rev(tft_ba9_fgseaRes_down))
+as_ggplot(plotGseaTable(tft_set[topPathways], ba9_ranks, tft_ba9_fgseaRes,
+              gseaParam=0.5,render=F))
+ggsave(path = "../Figures/AT.Figures/tifs/fgsea",width=8,height=10,units ='in',device='pdf',dpi=300,'ba9.fgsea.tft.pdf',
+       plot = )
+
+reactome_ba9_fgseaRes_up <- reactome_ba9_fgseaRes[NES > 0][head(order(padj), n=10), pathway]
+reactome_ba9_fgseaRes_down <- reactome_ba9_fgseaRes[NES < 0][head(order(padj), n=10), pathway]
+topPathways <- c(reactome_ba9_fgseaRes_up, rev(reactome_ba9_fgseaRes_down))
+as_ggplot(plotGseaTable(reactome_set[topPathways], ba9_ranks, reactome_ba9_fgseaRes,
+              gseaParam=0.5,render=F))
+ggsave(path = "../Figures/AT.Figures/tifs/fgsea",width=8,height=10,units ='in',device='pdf',dpi=300,'ba9.fgsea.reactome.pdf',
+       plot = )
+
+```
+### BA10 GSEA Analysis
+```{r}
+ba10_ranks <- ba10_cols_tidy$log2FC
+names(ba10_ranks) <- ba10_cols_tidy$gene_name
+head(ba10_ranks)
+
+barplot(sort(ba10_ranks, decreasing = T))
+
+hallmark_set <- gmtPathways("../GSEA/h.all.v7.5.1.symbols.gmt")
+hallmark_ba10_fgseaRes <- fgsea(hallmark_set, ba10_ranks, minSize=15, maxSize = 500)
+head(hallmark_ba10_fgseaRes[order(padj, -abs(NES)), ], n=10)
+hallmark_ba10_fgseaRes <- mutate(hallmark_ba10_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+position_set <- gmtPathways("../GSEA/c1.all.v7.5.1.symbols.gmt")
+position_ba10_fgseaRes <- fgsea(position_set, ba10_ranks, minSize=15, maxSize = 500)
+head(position_ba10_fgseaRes[order(padj, -abs(NES)), ], n=10)
+position_ba10_fgseaRes <- mutate(position_ba10_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+kegg_set <- gmtPathways("../GSEA/c2.cp.kegg.v7.5.1.symbols.gmt")
+kegg_ba10_fgseaRes <- fgsea(kegg_set, ba10_ranks, minSize=15, maxSize = 500)
+head(kegg_ba10_fgseaRes[order(padj, -abs(NES)), ], n=10)
+kegg_ba10_fgseaRes <- mutate(kegg_ba10_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+reactome_set <- gmtPathways("../GSEA/c2.cp.reactome.v7.5.1.symbols.gmt")
+reactome_ba10_fgseaRes <- fgsea(reactome_set, ba10_ranks, minSize=15, maxSize = 500)
+head(reactome_ba10_fgseaRes[order(padj, -abs(NES)), ], n=10)
+reactome_ba10_fgseaRes <- mutate(reactome_ba10_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+
+# Transcription factor targets
+tft_set <- gmtPathways("../GSEA/c3.tft.v7.5.1.symbols.gmt")
+tft_ba10_fgseaRes <- fgsea(tft_set, ba10_ranks, minSize=15, maxSize = 500)
+head(tft_ba10_fgseaRes[order(padj, -abs(NES)), ], n=10)
+tft_ba10_fgseaRes <- mutate(tft_ba10_fgseaRes,
+                                     status = ifelse(padj<0.05 &NES>0,"is_higher",
+                                                     ifelse(padj<0.05&NES<0,"is_lower","unaffected")))
+```
+## Statistics
+### Cerebellum is_lower_0.1 statistics
+```{r}
+# Total GC content
+# Kolmogorov-Smirnov Test 
+# Test Stat    P-Value 
+# 0.08484392 0.00010000 
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat    P-Value 
+# 0.01747926 0.00010000
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 54.98918   0.00010
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Kuiper
+# Test Stat    P-Value 
+# 0.09825884 0.00010000
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat    P-Value 
+# 0.01572035 0.00010000
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# DTS Test
+# Test Stat      P-Value 
+# 0.0004567403 0.0001000000
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat      P-Value 
+# 0.0004567403 0.0001000000
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+
+########################################################################################
+# Highest GC content
+# Kolmogorov-Smirnov Test
+# Test Stat   P-Value 
+# 0.06019462 0.00010000
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat      P-Value 
+# 3.756955e-05 1.00000e-04
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 0.1143146 0.0001000
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.06498242 0.0001000
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat    P-Value 
+# 0.01367565 0.00010000
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# DTS Test
+# Test Stat     P-Value 
+# 0.0003881688 0.0012000000
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat     P-Value 
+# 0.0003881688 0.0010000000
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+
+########################################################################################
+# Promoter GC content
+# Kolmogorov-Smirnov Test
+# Test Stat   P-Value 
+# 0.05729019 0.00010000
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat     P-Value 
+# 0.0001900273 0.0001000000
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 0.4564189 0.0001000
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.06582467 0.00010000 
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat    P-Value 
+# 0.01248066 0.00010000
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# DTS Test
+# Test Stat      P-Value 
+# 0.0003517621 0.0001000000
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat      P-Value 
+# 0.0003472733 0.0001000000 
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+
+
+########################################################################################
+# Gene Length for depleted and non-depleted genes
+# Kolmogorov-Smirnov Test
+# Test Stat    P-Value 
+# 0.06538058 0.00010000
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat     P-Value 
+# 0.005863694 0.000100000
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 20.81347   0.00010
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.09555144 0.00010000
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat   P-Value 
+# 7976.566    0.016
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# DTS Test
+# Test Stat   P-Value 
+# 450.2042    0.1622
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat   P-Value 
+# 450.2042    0.1654
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+
+
+########################################################################################
+# Basal Expression for depleted and non-depleted genes
+# Kolmogorov-Smirnov Test
+# Test Stat   P-Value 
+# 0.37018 0.0001000
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat   P-Value 
+# 0.3939635 0.0001000
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 1274.5237    0.0001
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.3703097 0.0001000 
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat   P-Value 
+# 2193.9663    0.0001
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# DTS Test
+# Test Stat   P-Value 
+# 99.15264    0.00010
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat   P-Value 
+# 99.15264    0.00010
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+```
+
+### BA9 is_lower_0.1 statistics
+```{r}
+# Total GC content
+# Kolmogorov-Smirnov Test 
+# Test Stat    P-Value 
+# 0.08484392 0.00010000 
+ks_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat    P-Value 
+# 0.01747926 0.00010000
+ad_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 54.98918   0.00010
+cvm_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Kuiper
+# Test Stat    P-Value 
+# 0.09825884 0.00010000
+kuiper_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat    P-Value 
+# 0.01572035 0.00010000
+wass_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# DTS Test
+# Test Stat      P-Value 
+# 0.0004567403 0.0001000000
+dts_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat      P-Value 
+# 0.0004567403 0.0001000000
+two_sample((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+
+########################################################################################
+# Highest GC content
+# Kolmogorov-Smirnov Test
+# Test Stat   P-Value 
+# 0.06019462 0.00010000
+ks_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat      P-Value 
+# 3.756955e-05 1.00000e-04
+ad_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 0.1143146 0.0001000
+cvm_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.06498242 0.0001000
+kuiper_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat    P-Value 
+# 0.01367565 0.00010000
+wass_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# DTS Test
+# Test Stat     P-Value 
+# 0.0003881688 0.0012000000
+dts_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat     P-Value 
+# 0.0003881688 0.0010000000
+two_sample((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+
+########################################################################################
+# Promoter GC content
+# Kolmogorov-Smirnov Test
+# Test Stat   P-Value 
+# 0.05729019 0.00010000
+ks_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat     P-Value 
+# 0.0001900273 0.0001000000
+ad_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 0.4564189 0.0001000
+cvm_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.06582467 0.00010000 
+kuiper_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat    P-Value 
+# 0.01248066 0.00010000
+wass_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# DTS Test
+# Test Stat      P-Value 
+# 0.0003517621 0.0001000000
+dts_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat      P-Value 
+# 0.0003472733 0.0001000000 
+two_sample((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+
+
+########################################################################################
+# Gene Length for depleted and non-depleted genes
+# Kolmogorov-Smirnov Test
+# Test Stat    P-Value 
+# 0.06538058 0.00010000
+ks_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat     P-Value 
+# 0.005863694 0.000100000
+ad_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 20.81347   0.00010
+cvm_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.09555144 0.00010000
+kuiper_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat   P-Value 
+# 7976.566    0.016
+wass_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# DTS Test
+# Test Stat   P-Value 
+# 450.2042    0.1622
+dts_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat   P-Value 
+# 450.2042    0.1654
+two_sample((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+
+
+########################################################################################
+# Basal Expression for depleted and non-depleted genes
+# Kolmogorov-Smirnov Test
+# Test Stat   P-Value 
+# 0.37018 0.0001000
+ks_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat   P-Value 
+# 0.3939635 0.0001000
+ad_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 1274.5237    0.0001
+cvm_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.3703097 0.0001000 
+kuiper_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat   P-Value 
+# 2193.9663    0.0001
+wass_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# DTS Test
+# Test Stat   P-Value 
+# 99.15264    0.00010
+dts_test((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat   P-Value 
+# 99.15264    0.00010
+two_sample((ba9_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (ba9_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+```
+
+### BA10 is_lower_0.1 statistics
+```{r}
+# Total GC content
+# Kolmogorov-Smirnov Test 
+# Test Stat    P-Value 
+# 0.08484392 0.00010000 
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat    P-Value 
+# 0.01747926 0.00010000
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 54.98918   0.00010
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Kuiper
+# Test Stat    P-Value 
+# 0.09825884 0.00010000
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat    P-Value 
+# 0.01572035 0.00010000
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# DTS Test
+# Test Stat      P-Value 
+# 0.0004567403 0.0001000000
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat      P-Value 
+# 0.0004567403 0.0001000000
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$gene_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$gene_gc_content,
+        nboots=5000)
+
+########################################################################################
+# Highest GC content
+# Kolmogorov-Smirnov Test
+# Test Stat   P-Value 
+# 0.06019462 0.00010000
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat      P-Value 
+# 3.756955e-05 1.00000e-04
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 0.1143146 0.0001000
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.06498242 0.0001000
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat    P-Value 
+# 0.01367565 0.00010000
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# DTS Test
+# Test Stat     P-Value 
+# 0.0003881688 0.0012000000
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat     P-Value 
+# 0.0003881688 0.0010000000
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$max_seg_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$max_seg_gc_content,
+        nboots=5000)
+
+########################################################################################
+# Promoter GC content
+# Kolmogorov-Smirnov Test
+# Test Stat   P-Value 
+# 0.05729019 0.00010000
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat     P-Value 
+# 0.0001900273 0.0001000000
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 0.4564189 0.0001000
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.06582467 0.00010000 
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat    P-Value 
+# 0.01248066 0.00010000
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# DTS Test
+# Test Stat      P-Value 
+# 0.0003517621 0.0001000000
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat      P-Value 
+# 0.0003472733 0.0001000000 
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$prom_gc_content,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$prom_gc_content,
+        nboots=5000)
+
+
+########################################################################################
+# Gene Length for depleted and non-depleted genes
+# Kolmogorov-Smirnov Test
+# Test Stat    P-Value 
+# 0.06538058 0.00010000
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat     P-Value 
+# 0.005863694 0.000100000
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 20.81347   0.00010
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.09555144 0.00010000
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat   P-Value 
+# 7976.566    0.016
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# DTS Test
+# Test Stat   P-Value 
+# 450.2042    0.1622
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat   P-Value 
+# 450.2042    0.1654
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$length,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$length,
+        nboots=5000)
+
+
+########################################################################################
+# Basal Expression for depleted and non-depleted genes
+# Kolmogorov-Smirnov Test
+# Test Stat   P-Value 
+# 0.37018 0.0001000
+ks_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Anderson-Darling
+# Test Stat   P-Value 
+# 0.3939635 0.0001000
+ad_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Cramer-Von Mises
+# Test Stat   P-Value 
+# 1274.5237    0.0001
+cvm_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Kuiper
+# Test Stat   P-Value 
+# 0.3703097 0.0001000 
+kuiper_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Wasserstein Distance Test
+# Test Stat   P-Value 
+# 2193.9663    0.0001
+wass_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# DTS Test
+# Test Stat   P-Value 
+# 99.15264    0.00010
+dts_test((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+# Two sample (what does this mean?)
+# Test Stat   P-Value 
+# 99.15264    0.00010
+two_sample((cer_cols_tidy%>%dplyr::filter(is_lower_0.1 =='is_lower_0.1'))$C_Cer_mean,
+        (cer_cols_tidy%>%dplyr::filter(is_lower_0.1=='not_lower_0.1'))$C_Cer_mean,
+        nboots=5000)
+```
+
+
+## Ataxia Genes
+```{r}
+ataxia_genes <- read.csv("ataxia_genes.csv",header=TRUE)
+ataxia_genes <- drop_na(left_join(ataxia_genes,dplyr::select(cer_cols_tidy,
+                                     gene_id,
+                                     cer_log2FC=log2FC,
+                                     cer_qvalue=qvalue,
+                                     cer_status=status_0.1,
+                                     cer_status_quarter=status_0.01_quarter,
+                                     cer_exp_quantile=exp_quantile),by="gene_id") %>%
+  left_join(dplyr::select(ba9_cols_tidy,
+                          gene_id,
+                          ba9_log2FC=log2FC,
+                          ba9_qvalue=qvalue,
+                          ba9_status=status_0.01,
+                          ba9_status_quarter=status_0.01_quarter,
+                          ba9_exp_quantile=exp_quantile),by="gene_id") %>%
+  left_join(dplyr::select(ba10_cols_tidy,
+                          gene_id,
+                          ba10_log2FC=log2FC,
+                          ba10_qvalue=qvalue,
+                          ba10_status=status_0.01,
+                          ba10_status_quarter=status_0.01_quarter,
+                          ba10_exp_quantile=exp_quantile),by="gene_id") %>%
+  dplyr::select(gene_name,gene_id,cer_log2FC,ba9_log2FC,ba10_log2FC,
+                cer_qvalue,ba9_qvalue,ba10_qvalue,cer_status,cer_status_quarter,ba9_status,ba10_status,
+                cer_exp_quantile,ba9_exp_quantile,ba10_exp_quantile))
+
+
+
+
+print("Cerebellum Ataxia Genes")
+table(ataxia_genes$cer_status)
+print("-----------------------------------")
+print("Cerebellum Ataxia Genes, |Log2FC|>2")
+table(ataxia_genes$cer_status_quarter)
+print("-----------------------------------")
+print("BA9 Cortex Ataxia Genes")
+table(ataxia_genes$ba9_status)
+print("-----------------------------------")
+print("BA9 Ataxia Genes, |Log2FC|>2")
+table(ataxia_genes$ba9_status_quarter)
+print("-----------------------------------")
+print("BA10 Cortex Ataxia Genes")
+table(ataxia_genes$ba10_status)
+print("-----------------------------------")
+print("BA10 Ataxia Genes, |Log2FC|>2")
+table(ataxia_genes$ba10_status_quarter)
+print("-----------------------------------")
+```
+## Transcriptional unit loss
+### DF Creation
+```{r}
+cer.trans.loss <- dplyr::filter(cer_cols_tidy,qvalue<0.01) %>%
+  dplyr::select(C_Cer_mean,log2FC,status_0.01,status_0.01_quarter,gene_id)%>%
+  mutate(transcript.change = ((2^log2FC)*C_Cer_mean)-C_Cer_mean) %>%
+  mutate(exp_quantile = ntile(C_Cer_mean,100)) %>%
+  mutate(direction=ifelse(transcript.change<0,'-','+')) %>%
+  drop_na(C_Cer_mean) %>%
+  distinct(C_Cer_mean,log2FC,.keep_all = TRUE)%>%
+  arrange(C_Cer_mean) %>%
+  rownames_to_column('exp.order') %>%
+  mutate(exp.order=as.numeric(exp.order))
+
+ba9.trans.loss <- dplyr::filter(ba9_cols_tidy,qvalue<0.01) %>%
+  dplyr::select(C_BA9_mean,log2FC,status_0.01,status_0.01_quarter,gene_id)%>%
+  mutate(transcript.change = ((2^log2FC)*C_BA9_mean)-C_BA9_mean) %>%
+  mutate(exp_quantile = ntile(C_BA9_mean,100)) %>%
+  mutate(direction=ifelse(transcript.change<0,'-','+')) %>%
+  drop_na(C_BA9_mean) %>%
+  distinct(C_BA9_mean,log2FC,.keep_all = TRUE)%>%
+  arrange(C_BA9_mean) %>%
+  rownames_to_column('exp.order') %>%
+  mutate(exp.order=as.numeric(exp.order))
+
+ba10.trans.loss <- dplyr::filter(ba10_cols_tidy,qvalue<0.01) %>%
+  dplyr::select(C_BA10_mean,log2FC,status_0.01,gene_id)%>%
+  mutate(transcript.change = ((2^log2FC)*C_BA10_mean)-C_BA10_mean) %>%
+  mutate(exp_quantile = ntile(C_BA10_mean,100)) %>%
+  mutate(direction=ifelse(transcript.change<0,'-','+')) %>%
+  drop_na(C_BA10_mean) %>%
+  distinct(C_BA10_mean,log2FC,.keep_all = TRUE)%>%
+  arrange(C_BA10_mean) %>%
+  rownames_to_column('exp.order') %>%
+  mutate(exp.order=as.numeric(exp.order))
+
+
+
+```
+
+
+## Plots to be exported for the paper (final dimensions)
+### Expression histograms
+```{r}
+group.colors <- c(is_lower_0.01 = "#FFB000", is_higher_0.01 = "#648FFF", unaffected ="#BABABA", 
+                  is_lower_0.01_quarter = "yellow", is_lower_0.01_quarter = "cyan")
+
+## Cerebellum
+ggplot()+
+  geom_histogram(data=dplyr::filter(cer.trans.loss,status_0.01=="is_lower_0.01"),
+                 aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="navajowhite",
+                 fill="navajowhite")+
+  geom_histogram(data=dplyr::filter(cer.trans.loss,status_0.01_quarter=="is_lower_0.01_quarter"),
+                 aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="#FFB000",
+                 fill="#FFB000")+
+  ylim(0,20)+
+  theme_bw()+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width=4,height=3,units = 'in', device='tiff', dpi=300,'cer.lower.exp.hist.tiff')
+ggplot(data=dplyr::filter(cer.trans.loss,status_0.01=="unaffected"))+
+  geom_histogram(aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="#BABABA",
+                 fill="#BABABA")+
+  geom_histogram(aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="#BABABA",
+                 fill="#BABABA")+
+  ylim(0,20)+
+  theme_bw()+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width=4,height=3,units ='in',device='tiff',dpi=300,'cer.unaffected.exp.hist.tiff')
+ggplot()+
+  geom_histogram(data=dplyr::filter(cer.trans.loss,status_0.01=="is_higher_0.01"),
+                 aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="slategray1",
+                 fill="slategray1")+
+  geom_histogram(data=dplyr::filter(cer.trans.loss,status_0.01_quarter=="is_higher_0.01_quarter"),
+                 aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="#648FFF",
+                 fill="#648FFF")+
+  ylim(0,20)+
+  theme_bw()+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width=4,height=3,units ='in',device='tiff',dpi=300,'cer.higher.exp.hist.tiff')
+
+## BA9
+ggplot(data=dplyr::filter(ba9.trans.loss,status_0.01=="is_lower_0.01"))+
+  geom_histogram(data=dplyr::filter(ba9.trans.loss,status_0.01=="is_lower_0.01"),
+                 aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="navajowhite",
+                 fill="navajowhite")+
+  geom_histogram(data=dplyr::filter(ba9.trans.loss,status_0.01_quarter=="is_lower_0.01_quarter"),
+                 aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="#FFB000",
+                 fill="#FFB000")+
+  ylim(0,30)+
+  theme_bw()+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width=4,height=3,units ='in',device='tiff',dpi=300,'ba9.lower.exp.hist.tiff')
+ggplot(data=dplyr::filter(ba9.trans.loss,status_0.01=="unaffected"))+
+  geom_histogram(data=dplyr::filter(ba9.trans.loss,status_0.01=="is_higher_0.01"),
+                 aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="slategray1",
+                 fill="slategray1")+
+  geom_histogram(data=dplyr::filter(ba9.trans.loss,status_0.01_quarter=="is_higher_0.01_quarter"),
+                 aes(exp_quantile),
+                 bins = 100,
+                 binwidth = 1,
+                 color="#648FFF",
+                 fill="#648FFF")+
+  ylim(0,30)+
+  theme_bw()+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width=4,height=3,units ='in',device='tiff',dpi=300,'ba9.higher.exp.hist.tiff')
+
+```
+
+
+### MA Plots
+```{r}
+group.colors <- c(is_lower_0.01 = "#FFB000", is_higher_0.01 = "#648FFF", unaffected ="#BABABA")
+
+ggplot(data = arrange(cer_cols_tidy,desc(status_0.01)),aes(x=log10mean,y=log2FC))+
+  geom_point(aes(color=status_0.01)) +
+  geom_hline(yintercept = 1,linetype="dashed")+
+  geom_hline(yintercept = -1,linetype="dashed")+
+  geom_hline(yintercept = 2,linetype="solid")+
+  geom_hline(yintercept = -2,linetype="solid")+
+  theme_bw() +
+  xlim(0.5,6)+
+  ylim(-6,6)+
+  ggtitle("AT Cerebellum MA Plot") +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'cer_ma.tiff')
+# BA9
+ggplot(data = arrange(ba9_cols_tidy,desc(status_0.01)),aes(x=log10mean,y=log2FC))+
+  geom_point(aes(color=status_0.01)) +
+  geom_hline(yintercept = 1,linetype="dashed")+
+  geom_hline(yintercept = -1,linetype="dashed")+
+  geom_hline(yintercept = 2,linetype="solid")+
+  geom_hline(yintercept = -2,linetype="solid")+
+  theme_bw() +
+  ggtitle("AT BA9 Cortex MA Plot") +
+  xlim(0.5,6)+
+  ylim(-6,6)+
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba9_ma.tiff')
+# BA10
+ggplot(data = arrange(ba10_cols_tidy,desc(status_0.01)),aes(x=log10mean,y=log2FC))+
+  geom_point(aes(color=status_0.01)) +
+  geom_hline(yintercept = 1,linetype="dashed")+
+  geom_hline(yintercept = -1,linetype="dashed")+
+  geom_hline(yintercept = 2,linetype="solid")+
+  geom_hline(yintercept = -2,linetype="solid")+
+  theme_bw() +
+  xlim(0.5,6)+
+  ylim(-6,6)+
+  ggtitle("AT BA10 Cortex MA Plot") +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba10_ma.tiff')
+```
+
+
+### Cerebellum Density Plots
+```{r}
+group.colors <- c(is_lower_0.01 = "#FFB000", is_higher_0.01 = "#648FFF", unaffected ="#BABABA")
+
+ggplot(cer_cols_tidy,aes(gene_gc_content)) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  xlab('GC Content') +
+  xlim(0.3,0.8)+
+  ylim(0.0,7.5)+
+  ylab ('Gene Density') + 
+  ggtitle('Cerebellum Gene GC Content') +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'cer_total_gc.tiff')
+# Maximum 100nt segment GC
+ggplot(cer_cols_tidy,aes(max_seg_gc_content)) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  xlab('GC Content') +
+  xlim(0.4,1)+
+  ylim(0.0,7.5)+
+  ylab ('Gene Density') + 
+  ggtitle('Cerebellum 100nt Segment GC Content') +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'cer_100nt_gc.tiff')
+# Average Expression in Cerebellum, log transformed axis
+ggplot(cer_cols_tidy,aes(x=log(C_Cer_mean))) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  xlab('ln(Gene Transcript Abundance)') +
+  ylab ('Gene Density') + 
+  ggtitle('Cerebellum Control Expression') +
+  theme_bw() +
+  scale_color_manual(values=group.colors) 
+  # theme(plot.title = element_blank(),
+  #       axis.title = element_blank(),
+  #       axis.text = element_blank(),
+  #       legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'cer_exp.tiff')
+# Length
+ggplot(cer_cols_tidy,aes(x=log(length))) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'cer_length.tiff')
+```
+### BA9 Density Plots
+```{r}
+### BA9 Density Plots
+ggplot(ba9_cols_tidy,aes(gene_gc_content)) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  xlab('GC Content') +
+  xlim(0.3,0.8)+
+  ylim(0.0,7.5)+
+  ylab ('Gene Density') + 
+  ggtitle('BA9 Gene GC Content') +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba9_total_gc.tiff')
+# Maximum 100nt segment GC
+ggplot(ba9_cols_tidy,aes(max_seg_gc_content)) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  xlab('GC Content') +
+  xlim(0.4,1)+
+  ylim(0.0,7.5)+
+  ylab ('Gene Density') + 
+  ggtitle('BA9 100nt Segment GC Content') +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba9_100nt_gc.tiff')
+# Average Expression in BA9, log transformed axis
+ggplot(ba9_cols_tidy,aes(x=log(C_BA9_mean))) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  xlab('ln(Gene Transcript Abundance)') +
+  ylab ('Gene Density') + 
+  ggtitle('BA9 Control Expression') +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba9_exp.tiff')
+# Length
+ggplot(ba9_cols_tidy,aes(x=log(length))) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba9_length.tiff')
+```
+### BA10 Density Plots
+```{r}
+### BA10 Density Plots
+ggplot(ba10_cols_tidy,aes(gene_gc_content)) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  xlab('GC Content') +
+  xlim(0.3,0.8)+
+  ylim(0.0,7.5)+
+  ylab ('Gene Density') + 
+  ggtitle('BA10 Gene GC Content') +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba10_total_gc.tiff')
+# Maximum 100nt segment GC
+ggplot(ba10_cols_tidy,aes(max_seg_gc_content)) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  xlab('GC Content') +
+  xlim(0.4,1)+
+  ylim(0.0,7.5)+
+  ylab ('Gene Density') + 
+  ggtitle('BA10 100nt Segment GC Content') +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba10_100nt_gc.tiff')
+# Average Expression in BA10, log transformed axis
+ggplot(ba10_cols_tidy,aes(x=log(C_BA10_mean))) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  xlab('ln(Gene Transcript Abundance)') +
+  ylab ('Gene Density') + 
+  ggtitle('BA10 Control Expression') +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba10_exp.tiff')
+# Length
+ggplot(ba10_cols_tidy,aes(x=log(length))) +
+  geom_density(aes(color=status_0.01),size=1.5) +
+  theme_bw() +
+  scale_color_manual(values=group.colors) +
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 4, height = 3, units = 'in', device='tiff', dpi=300,'ba10_length.tiff')
+```
+### Transcript Change Expression Order Plots
+```{r}
+group.colors <- c(is_lower_0.01 = "#FFB000", is_higher_0.01 = "#648FFF", unaffected ="#BABABA")
+
+# Expression order, raw axes
+ggplot(data=cer.trans.loss)+
+  geom_point(aes(x=exp.order,y=transcript.change,color=status_0.01),alpha=1/2)+
+  ylim(-60000,60000)+
+  theme_bw()+
+  scale_color_manual(values=group.colors)+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width=4,height=3,units='in',device='tiff',dpi=300,'cer_exp_order_trans_loss.tiff')
+ggplot(data=ba9.trans.loss)+
+  geom_point(aes(x=exp.order,y=transcript.change,color=status_0.01),alpha=1/2)+
+  ylim(-40000,40000)+
+  theme_bw()+
+  scale_color_manual(values=group.colors)+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width=4,height=3,units='in',device='tiff',dpi=300,'ba9_exp_order_trans_loss.tiff')
+ggplot(data=ba10.trans.loss)+
+  geom_point(aes(x=exp.order,y=transcript.change,color=status_0.01),alpha=1/2)+
+  ylim(-30000,30000)+
+  theme_bw()+
+  scale_color_manual(values=group.colors)+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/",width=4,height=3,units='in',device='tiff',dpi=300,'ba10_exp_order_trans_loss.tiff')
+
+
+```
+### Transcript Change Trendline Plots
+```{r}
+group.colors <- c(is_lower_0.01 = "#FFB000", is_higher_0.01 = "#648FFF", unaffected ="#BABABA")
+
+# Log2FC > 0
+ggplot(data=(dplyr::filter(cer.trans.loss,transcript.change>0)),
+       aes(x=log(as.numeric(C_Cer_mean)),y=log(transcript.change)))+
+  geom_point(aes(color=status_0.01))+
+  theme_bw()+
+  scale_color_manual(values=group.colors) +
+  geom_abline(intercept = 0,slope=1)+ #100% transcript increase
+  geom_abline(intercept = 0.693,slope=1)+ #200% transcript increase
+  geom_abline(intercept = -0.2877,slope=1,linetype="dashed")+ #75% transcript increase
+  geom_abline(intercept = -0.693,slope=1)+ #50% transcript increase
+  geom_abline(intercept = -1.386,slope=1,linetype="dashed")+ #25% transcript increase
+  ggtitle("Cerebellum Increased Genes")+
+  xlab("ln(WT abundance)")+
+  ylab("ln(abundance change)")+
+  ylim(2,11)+
+  xlim(2,11)+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 6.67, height = 5, units = 'in', device='tiff', dpi=700,'cer_up_trendlines.tiff')
+
+ggplot(data=(dplyr::filter(ba9.trans.loss,transcript.change>0)),
+       aes(x=log(as.numeric(C_BA9_mean)),y=log(transcript.change)))+
+  geom_point(aes(color=status_0.01))+
+  theme_bw()+
+  scale_color_manual(values=group.colors) +
+  geom_abline(intercept = 0,slope=1)+
+  geom_abline(intercept = 0.693,slope=1)+ #200% transcript increase
+  geom_abline(intercept = -0.2877,slope=1,linetype="dashed")+ #75% transcript increase
+  geom_abline(intercept = -0.693,slope=1)+ #50% transcript increase
+  geom_abline(intercept = -1.386,slope=1,linetype="dashed")+ #25% transcript increase
+  ggtitle("BA9 Increased Genes")+
+  xlab("ln(WT abundance)")+
+  ylab("ln(abundance change)")+
+  ylim(2,11)+
+  xlim(2,11)+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 6.67, height = 5, units = 'in', device='tiff', dpi=700,'ba9_up_trendlines.tiff')
+
+ggplot(data=(dplyr::filter(ba10.trans.loss,transcript.change>0)),
+       aes(x=log(as.numeric(C_BA10_mean)),y=log(transcript.change)))+
+  geom_point(aes(color=status_0.01))+
+  theme_bw()+
+  scale_color_manual(values=group.colors) +
+  geom_abline(intercept = 0,slope=1)+
+  geom_abline(intercept = 0.693,slope=1)+ #200% transcript increase
+  geom_abline(intercept = -0.2877,slope=1,linetype="dashed")+ #75% transcript increase
+  geom_abline(intercept = -0.693,slope=1)+ #50% transcript increase
+  geom_abline(intercept = -1.386,slope=1,linetype="dashed")+ #25% transcript increase
+  ggtitle("BA10 Increased Genes")+
+  xlab("ln(WT abundance)")+
+  ylab("ln(abundance change)")+
+  ylim(2,11)+
+  xlim(2,11)+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 6.67, height = 5, units = 'in', device='tiff', dpi=700,'ba10_up_trendlines.tiff')
+
+
+
+ggplot(data=(dplyr::filter(cer.trans.loss,transcript.change<0)),
+       aes(x=log(as.numeric(C_Cer_mean)),y=-1*log(-1*transcript.change)))+
+  geom_point(aes(color=status_0.01))+
+  theme_bw()+
+  scale_color_manual(values=group.colors) +
+  geom_abline(intercept=1.386,slope=-1,linetype='dashed')+ #25% transcript reduction
+  geom_abline(intercept = 0.693,slope=-1)+ #50% transcript reduction (is_lower)
+  geom_abline(intercept=0.2877,slope=-1,linetype='dashed')+ #75% transcript reduction
+  geom_abline(intercept=0,slope=-1)+
+  ggtitle("Cerebellum Decreased Genes")+
+  xlab("ln(WT abundance)")+
+  ylab("-ln(abundance change)")+
+  ylim(-11,-2)+
+  xlim(2.5,11)+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 6.67, height = 5, units = 'in', device='tiff', dpi=700,'cer_down_trendlines.tiff')
+
+ggplot(data=(dplyr::filter(ba9.trans.loss,transcript.change<0)),
+       aes(x=log(as.numeric(C_BA9_mean)),y=-1*log(-1*transcript.change)))+
+  geom_point(aes(color=status_0.01))+
+  theme_bw()+
+  scale_color_manual(values=group.colors) +
+  geom_abline(intercept=1.386,slope=-1,linetype='dashed')+ #25% transcript reduction
+  geom_abline(intercept = 0.693,slope=-1)+ #50% transcript reduction (is_lower)
+  geom_abline(intercept=0.2877,slope=-1,linetype='dashed')+ #75% transcript reduction
+  geom_abline(intercept=0,slope=-1)+
+  ggtitle("BA9 Decreased Genes")+
+  xlab("ln(WT abundance)")+
+  ylab("-ln(abundance change)")+
+  ylim(-11,-2)+
+  xlim(2.5,11)+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 6.67, height = 5, units = 'in', device='tiff', dpi=700,'ba9_down_trendlines.tiff')
+
+ggplot(data=(dplyr::filter(ba10.trans.loss,transcript.change<0)),
+       aes(x=log(as.numeric(C_BA10_mean)),y=-1*log(-1*transcript.change)))+
+  geom_point(aes(color=status_0.01))+
+  theme_bw()+
+  scale_color_manual(values=group.colors) +
+  geom_abline(intercept=1.386,slope=-1,linetype='dashed')+ #25% transcript reduction
+  geom_abline(intercept = 0.693,slope=-1)+ #50% transcript reduction (is_lower)
+  geom_abline(intercept=0.2877,slope=-1,linetype='dashed')+ #75% transcript reduction
+  geom_abline(intercept=0,slope=-1)+
+  ggtitle("BA10 Decreased Genes")+
+  xlab("ln(WT abundance)")+
+  ylab("-ln(abundance change)")+
+  ylim(-11,-2)+
+  xlim(2.5,11)+
+  theme(plot.title = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        legend.position = "None")
+ggsave(path = "../Figures/AT.Figures/tifs/", width = 6.67, height = 5, units = 'in', device='tiff', dpi=700,'ba10_down_trendlines.tiff')
+
+```
