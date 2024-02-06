@@ -1,7 +1,9 @@
 # ATM_par_rchip_paper
 Repository containing Python scripts and RMarkdown document for ATM_par_rchip paper.
 
-Figure 4 uses the python scripts to process Bedgraph files.
+Figures 1 and 2 are found on "AT_paper.Swish_analysis.rmd"
+
+Figure 6 uses the python scripts to process Bedgraph files.
 
 "sample_prep.sh" separates the bedgraph files by chromosome.
 
@@ -28,5 +30,3 @@ Figure 4 uses the python scripts to process Bedgraph files.
 "par_rchip_gc.dmso.py" prepares data for plotting PAR signal against RChIP and GC content
 
 "par_rchip_gc.atmi.py" same as above, but for ATMi treated cells.
-
-Figures 5 and 6 are found on "AT_paper.Swish_analysis.rmd"
